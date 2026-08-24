@@ -7942,6 +7942,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             finally:
                 _clear_planned_restart_notification()
 
+        # Fresh boot (launchd RunAtLoad, manual start) — no restart marker,
+        # no chat restart. Notify home channels once so the user knows
+        # Hermes is ready after login/boot.
+        fresh_boot = (
+            not chat_restart_notification_pending
+            and not planned_restart_notification_pending
+            and connected_count > 0
+        )
+        if fresh_boot:
+            try:
+                await self._send_home_channel_startup_notifications(
+                    skip_targets=None,
+                )
+            except Exception:
+                pass  # best-effort
+
         # Automatically continue fresh sessions that were interrupted by the
         # previous gateway restart/shutdown.  The resume_pending flag is cleared
         # by the normal successful-turn path, so a failed auto-resume remains
@@ -16206,6 +16222,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not notify_path.exists():
             return None
 
+        # Same one-shot race as home-channel startup notifications: the
+        # originating chat's adapter may still be mid-bootstrap (Telegram's
+        # send path clears only after the first successful polling round).
+        # Wait briefly so the reply isn't rejected as send_path_degraded.
+        await self._wait_for_send_paths_healthy()
+
         try:
             data = json.loads(notify_path.read_text())
             platform_str = data.get("platform")
@@ -16237,14 +16259,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             metadata = self._thread_metadata_for_target(
                 platform,
                 chat_id,
-                thread_id,
+                thread_id=thread_id,
                 chat_type=chat_type,
                 reply_to_message_id=message_id,
                 adapter=adapter,
             )
+            # Append a live /status-style snapshot to the restart reply.
+            status_block = await self._lifecycle_status_block(
+                platform,
+                str(chat_id),
+                thread_id=str(thread_id) if thread_id else None,
+            )
+            payload = (
+                f"♻️ Gateway Direstart - Silahkan Lanjut.\n\n{status_block}"
+                if status_block
+                else "♻️ Gateway Direstart - Silahkan Lanjut."
+            )
             result = await adapter.send(
                 str(chat_id),
-                "♻ Gateway restarted successfully. Your session continues.",
+                payload,
                 metadata=_non_conversational_metadata(metadata, platform=platform),
             )
             # adapter.send() catches provider errors (e.g. "Chat not found")
@@ -16272,6 +16305,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         finally:
             notify_path.unlink(missing_ok=True)
 
+    async def _wait_for_send_paths_healthy(self, *, timeout: float = 30.0) -> None:
+        """Wait (bounded) for degraded adapter send paths before lifecycle sends.
+
+        Telegram marks its send path degraded during polling bootstrap and only
+        clears the flag after the first successful getUpdates round. One-shot
+        startup notifications sent earlier are rejected with
+        ``send_path_degraded`` and lost (lifecycle messages have no retry
+        queue), so wait briefly for recovery; exit early once every adapter is
+        healthy so boots that connect fast are not delayed.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            pending = sorted(
+                platform.value
+                for platform, adapter in self.adapters.items()
+                if getattr(adapter, "_send_path_degraded", False)
+            )
+            if not pending:
+                return
+            if loop.time() >= deadline:
+                logger.warning(
+                    "Adapter send paths still degraded after %.0fs (%s); "
+                    "sending lifecycle notifications anyway",
+                    timeout,
+                    ", ".join(pending),
+                )
+                return
+            await asyncio.sleep(0.5)
+
+    async def _lifecycle_status_block(
+        self,
+        platform: Platform,
+        chat_id: str,
+        *,
+        thread_id: Optional[str] = None,
+    ) -> str:
+        """Render a /status-style snapshot appended to lifecycle notifications."""
+        try:
+            from gateway.platforms.base import MessageEvent
+            from gateway.session import SessionSource
+
+            source = SessionSource(
+                platform=platform,
+                chat_id=str(chat_id),
+                chat_type="dm",
+                thread_id=thread_id,
+            )
+            return await self._handle_status_command(
+                MessageEvent(text="/status", source=source)
+            )
+        except Exception as exc:
+            logger.debug(
+                "Lifecycle status block unavailable for %s:%s: %s",
+                platform.value, chat_id, exc,
+            )
+            return ""
+
     async def _send_home_channel_startup_notifications(
         self,
         *,
@@ -16283,9 +16374,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         home channel. ``skip_targets`` lets startup avoid duplicate messages
         when a more specific restart notification is queued for the same chat.
         """
+        # Lifecycle sends are one-shot: wait briefly for freshly-booted adapters
+        # (notably Telegram's post-polling send-path recovery) instead of
+        # firing into a known-degraded send path and losing the message.
+        await self._wait_for_send_paths_healthy()
         delivered: set[tuple[str, str, Optional[str]]] = set()
         skipped = skip_targets or set()
-        message = "♻️ Gateway online — Hermes is back and ready."
+        message = "♻️ Gateway Online - Hermes Siap Digunakan."
 
         for platform, adapter in self.adapters.items():
             home = self.config.get_home_channel(platform)
@@ -16304,6 +16399,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if target in skipped or target in delivered:
                 continue
 
+            # Append a live /status-style snapshot so the lifecycle ping
+            # doubles as a post-boot health report.
+            status_block = await self._lifecycle_status_block(
+                platform,
+                str(home.chat_id),
+                thread_id=str(home.thread_id) if home.thread_id else None,
+            )
+            payload = f"{message}\n\n{status_block}" if status_block else message
+
             try:
                 metadata = self._thread_metadata_for_target(
                     platform,
@@ -16314,7 +16418,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if metadata:
                     result = await adapter.send(
                         str(home.chat_id),
-                        message,
+                        payload,
                         metadata=_non_conversational_metadata(metadata, platform=platform),
                     )
                 else:
@@ -16322,11 +16426,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if _startup_meta:
                         result = await adapter.send(
                             str(home.chat_id),
-                            message,
+                            payload,
                             metadata=_startup_meta,
                         )
                     else:
-                        result = await adapter.send(str(home.chat_id), message)
+                        result = await adapter.send(str(home.chat_id), payload)
                 if result is not None and getattr(result, "success", True) is False:
                     logger.warning(
                         "Home-channel startup notification failed for %s:%s: %s",
