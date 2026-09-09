@@ -897,10 +897,20 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             await self._finalize_edit(self._accumulated)
 
     async def _finalize_edit(self, text: str, *, record: bool = True) -> bool:
-        """finalize=True send_or_edit; on success mark the turn delivered (+ record payload)."""
+        """finalize=True send_or_edit; on success mark the turn delivered (+ record payload).
+
+        Even when `_send_or_edit` fails (e.g. no message_id yet), content was already
+        streamed to the user — mark `_final_content_delivered` so the gateway suppresses
+        the normal final send and avoids a duplicate.
+        """
         self._final_response_sent = await self._send_or_edit(text, finalize=True)
         if self._final_response_sent:
             self._mark_final_delivered(record=text if record else None)
+        elif self._use_native_streaming:
+            # Native streaming already pushed content to the user before this
+            # finalize attempt. Mark content delivered even if the final edit
+            # itself failed, so the gateway doesn't re-send a duplicate.
+            self._final_content_delivered = True
         return self._final_response_sent
 
     def _cumulative_transport(self) -> bool:
