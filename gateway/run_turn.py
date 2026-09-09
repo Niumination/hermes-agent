@@ -4102,6 +4102,16 @@ class GatewayTurnMixin:
                     fail_result="Stale-finalize reconciliation edit failed for session %s (%s); sending complete response via normal final send.",
                     fail_exc="Stale-finalize reconciliation edit failed for session %s: %s; sending complete response via normal final send.",
                 )
+            elif getattr(_sc, "_final_response_sent", False):
+                # Consumer successfully sent the final via the edit/finalize path but the
+                # recorded payload differs from the agent's final_text (plugin hooks appended,
+                # or the visible prefix diverged). Content reached the user — suppress the
+                # normal final send to avoid a duplicate.
+                logger.info(
+                    "Stale finalize with content already delivered (no editable message): suppressing normal final send for session %s (payload mismatch, content delivered via _final_response_sent)",
+                    _sk,
+                )
+                response["already_sent"] = True
             else:
                 logger.info(
                     "Stale streamed finalize detected for session %s with no editable message; delivering complete response via normal final send (#71643).",
