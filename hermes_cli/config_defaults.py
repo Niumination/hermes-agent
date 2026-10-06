@@ -1833,6 +1833,8 @@ DEFAULT_CONFIG = {
         "ttl_minutes": 20,
         # Per-provider override URLs for self-hosted curation lists using the same schema, e.g.
         # providers: {openrouter: {url: https://example.com/my-curation.json}}.
+        # Per-provider options: free_only (bool) — when true, the /model picker for that
+        # provider shows only zero-priced models (fetched live from the provider API).
         "providers": {},
     },
     # Per-model metadata overrides. Fields: context_window, supports_tools,

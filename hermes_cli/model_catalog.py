@@ -290,8 +290,77 @@ def get_curated_openrouter_models() -> list[tuple[str, str]] | None:
     return [(mid, str(m.get("description") or "")) for mid, m in rows] or None
 
 
+_nous_free_models_cache: tuple[float, list[str]] | None = None
+_NOUS_FREE_MODELS_TTL = 300.0  # 5 minutes
+
+
+def _fetch_nous_free_models() -> list[str]:
+    """Fetch live Nous Portal model list and return IDs of zero-priced (free) models.
+
+    Reads the access token from auth.json, calls the inference API /models endpoint,
+    and filters for models where both prompt and completion pricing are 0.
+    Result is cached in-process for 5 minutes.
+    """
+    global _nous_free_models_cache
+
+    now = time.time()
+    if _nous_free_models_cache is not None and now - _nous_free_models_cache[0] < _NOUS_FREE_MODELS_TTL:
+        return list(_nous_free_models_cache[1])
+
+    try:
+        from hermes_constants import get_hermes_home
+        auth_path = get_hermes_home() / "auth.json"
+        with open(auth_path, encoding="utf-8") as f:
+            auth_data = json.load(f)
+        creds = auth_data.get("providers", {}).get("nous", {})
+        token = creds.get("access_token", "")
+        if not token:
+            return []
+        base = creds.get("inference_base_url", "https://inference-api.nousresearch.com/v1")
+        url = base.rstrip("/") + "/models"
+        req = urllib.request.Request(url, headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        })
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception:
+        return []
+
+    models = data.get("data", data) if isinstance(data, dict) else data
+    if not isinstance(models, list):
+        return []
+
+    free_ids = []
+    for m in models:
+        if not isinstance(m, dict):
+            continue
+        pricing = m.get("pricing", {})
+        try:
+            prompt_price = float(pricing.get("prompt", "1"))
+            completion_price = float(pricing.get("completion", "1"))
+        except (TypeError, ValueError):
+            continue
+        if prompt_price == 0.0 and completion_price == 0.0:
+            mid = m.get("id", "")
+            if mid:
+                free_ids.append(mid)
+
+    _nous_free_models_cache = (now, free_ids)
+    return list(free_ids)
+
+
 def get_curated_nous_models() -> list[str] | None:
-    """Nous Portal's curated model ids from the manifest."""
+    """Nous Portal's curated model ids from the manifest.
+
+    When ``model_catalog.providers.nous.free_only`` is true, returns only zero-priced
+    (free) models fetched live from the Nous Portal API instead of the full manifest list.
+    """
+    cfg = _load_catalog_config()
+    provider_cfg = cfg["providers"].get("nous", {})
+    if isinstance(provider_cfg, dict) and provider_cfg.get("free_only"):
+        free_ids = _fetch_nous_free_models()
+        return free_ids or None
     return [mid for mid, _ in _block_ids(_get_provider_block("nous"))] or None
 
 
