@@ -4057,16 +4057,6 @@ class GatewayTurnMixin:
         # Unrelated commentary/progress must not be mistaken for the final response (#14238).
         _previewed = bool(response.get("response_previewed"))
         _content_delivered = bool(_sc and getattr(_sc, "final_content_delivered", False))
-        # Even if the consumer flag wasn't set, check if content was already
-        # delivered to the user via the stream consumer. This catches the case
-        # where _finalize_edit(record=False) ran but _send_or_edit returned
-        # False while native streaming had already pushed content.
-        if not _content_delivered and _sc is not None:
-            _has_delivered = getattr(_sc, "has_delivered_text", None)
-            if callable(_has_delivered) and callable(_final):
-                with suppress(Exception):
-                    if _has_delivered(_final):
-                        _content_delivered = True
         # #71643: a *successful* finalize edit can still carry only the last preview snapshot — deltas
         # generated between that edit and stream completion never reach any API call, and both suppression
         # flags are set from the call's success rather than its content. Reconcile the consumer's recorded
